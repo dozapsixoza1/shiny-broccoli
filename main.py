@@ -7,8 +7,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ---------- КОНФИГ ----------
-BOT_TOKEN = "ВСТАВЬ_ТОКЕН_БОТА"
-ADMIN_IDS = [123456789]           # ID админов
+BOT_TOKEN = "8663442498:AAEvRdeDMzqJ7wjtoSoiJrIzSzK71v4p7oE"
+ADMIN_IDS = [8675927241]           # ID админов
 
 # ---------- ИНИТ ----------
 bot = Bot(token=BOT_TOKEN)
