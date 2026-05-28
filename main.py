@@ -16,7 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ==================== КОНФИГ ====================
 BOT_TOKEN = "8663442498:AAEvRdeDMzqJ7wjtoSoiJrIzSzK71v4p7oE"
 ADMIN_IDS = [8675927241]  # Добавьте ID админов
-CRYPTOBOT_API_TOKEN = "YOUR_CRYPTOBOT_API_TOKEN_HERE"
+CRYPTOBOT_API_TOKEN = "588537:AAau2AOcmKEyh9f3H9fvlne4FvhtImZS2k6"
 CRYPTOBOT_BASE_URL = "https://pay.crypt.bot/api"
 
 # ==================== ЛОГИРОВАНИЕ ====================
@@ -86,11 +86,12 @@ class Database:
             "myanmar": Product("myanmar", "🇲🇲 +95 Мьянма", 35, []),
             "random": Product("random", "🎲 Random Number", 25, [])
         }
-        self.cart: Dict[int, Dict[str, int]] = {}  # {user_id: {product_code: quantity}}
+        self.cart: Dict[int, Dict[str, int]] = {}
         self.promo_codes: Dict[str, PromoCode] = {}
         self.orders: List[Order] = []
         self.active_users: set = set()
-        self.invoice_mapping: Dict[int, tuple] = {}  # {invoice_id: (user_id, order_id)}
+        self.invoice_mapping: Dict[int, tuple] = {}
+        self.active_payments: Dict[str, bool] = {}  # Отслеживание активных платежей
 
     def get_cart_total(self, user_id: int) -> int:
         total = 0
@@ -100,7 +101,7 @@ class Database:
                     total += self.products[product_code].price * quantity
         return total
 
-    def apply_promo(self, user_id: int, code: str) -> tuple[bool, str, int]:
+    def apply_promo(self, user_id: int, code: str) -> tuple:
         """Применить промокод. Возвращает (успех, сообщение, новая сумма)"""
         if code not in self.promo_codes:
             return False, "❌ Промокод не найден", self.get_cart_total(user_id)
@@ -120,7 +121,7 @@ class Database:
         backup = {
             "products": {code: asdict(product) for code, product in self.products.items()},
             "promo_codes": {code: asdict(promo) for code, promo in self.promo_codes.items()},
-            "orders": [asdict(order) for order in self.orders],
+            "orders": [asdict(order) for order in self.orders[-100:]],
             "active_users": list(self.active_users),
             "timestamp": datetime.now().isoformat()
         }
@@ -129,7 +130,7 @@ class Database:
 db = Database()
 
 # ==================== CRYPTOBOT API ====================
-async def crypto_api_request(method: str, endpoint: str, **kwargs) -> Optional[dict]:
+async def crypto_api_request(method: str, endpoint: str, timeout: int = 5, **kwargs) -> Optional[dict]:
     """Универсальная функция для запросов к CryptoBot API"""
     headers = {
         "Crypto-Pay-API-Token": CRYPTOBOT_API_TOKEN,
@@ -139,12 +140,20 @@ async def crypto_api_request(method: str, endpoint: str, **kwargs) -> Optional[d
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.request(method, url, headers=headers, json=kwargs if kwargs else None) as response:
+            async with session.request(
+                method, url, 
+                headers=headers, 
+                json=kwargs if kwargs else None,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as response:
                 if response.status == 200:
                     return await response.json()
                 else:
                     logger.error(f"CryptoBot error: {response.status}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error(f"CryptoBot timeout for {endpoint}")
+        return None
     except Exception as e:
         logger.error(f"CryptoBot request error: {e}")
         return None
@@ -171,64 +180,83 @@ async def create_invoice(user_id: int, amount: int, order_id: str) -> Optional[i
 
 async def check_invoice_status(invoice_id: int) -> Optional[str]:
     """Проверить статус инвойса"""
-    response = await crypto_api_request("GET", f"invoices/info?invoice_id={invoice_id}")
+    response = await crypto_api_request("GET", f"invoices/info?invoice_id={invoice_id}", timeout=3)
     if response and response.get("ok"):
         return response["result"]["status"]
     return None
 
 async def wait_for_payment(bot: Bot, user_id: int, order_id: str, invoice_id: int, timeout: int = 600):
     """Ожидать оплату инвойса (асинхронно, опрос каждые 5 секунд)"""
+    if order_id in db.active_payments:
+        return
+    
+    db.active_payments[order_id] = True
     start_time = asyncio.get_event_loop().time()
     
-    while asyncio.get_event_loop().time() - start_time < timeout:
-        status = await check_invoice_status(invoice_id)
+    try:
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            try:
+                status = await check_invoice_status(invoice_id)
+                
+                if status == "paid":
+                    order = next((o for o in db.orders if o.order_id == order_id), None)
+                    if order:
+                        # Выдаём номера
+                        for product_code, quantity in db.cart.get(user_id, {}).items():
+                            if product_code in db.products:
+                                product = db.products[product_code]
+                                issued_numbers = product.numbers[:quantity]
+                                order.numbers = issued_numbers
+                                product.numbers = product.numbers[quantity:]
+                        
+                        order.status = "paid"
+                        
+                        # Отправляем номера пользователю
+                        if order.numbers:
+                            numbers_text = "\n".join(order.numbers)
+                            try:
+                                await bot.send_message(
+                                    user_id,
+                                    f"✅ <b>Оплата успешна!</b>\n\n"
+                                    f"Заказ #{order_id}\n"
+                                    f"Ваши номера:\n\n<code>{numbers_text}</code>\n\n"
+                                    f"Сумма: {order.total_amount} RUB",
+                                    parse_mode="HTML"
+                                )
+                            except Exception as e:
+                                logger.error(f"Error sending numbers: {e}")
+                        
+                        # Очищаем корзину
+                        if user_id in db.cart:
+                            db.cart[user_id].clear()
+                    
+                    return
+                
+                elif status == "expired":
+                    order = next((o for o in db.orders if o.order_id == order_id), None)
+                    if order:
+                        order.status = "cancelled"
+                        try:
+                            await bot.send_message(user_id, "⏱️ Время оплаты истекло. Заказ отменён.")
+                        except:
+                            pass
+                    return
+                
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Payment check error: {e}")
+                await asyncio.sleep(5)
         
-        if status == "paid":
-            # Оплата прошла успешно
-            order = next((o for o in db.orders if o.order_id == order_id), None)
-            if order:
-                # Выдаём номера
-                for product_code, quantity in db.cart.get(user_id, {}).items():
-                    if product_code in db.products:
-                        product = db.products[product_code]
-                        issued_numbers = product.numbers[:quantity]
-                        order.numbers = issued_numbers
-                        product.numbers = product.numbers[quantity:]
-                
-                order.status = "paid"
-                
-                # Отправляем номера пользователю
-                numbers_text = "\n".join(order.numbers)
-                await bot.send_message(
-                    user_id,
-                    f"✅ <b>Оплата успешна!</b>\n\n"
-                    f"Заказ #{order_id}\n"
-                    f"Ваши номера:\n\n<code>{numbers_text}</code>\n\n"
-                    f"Сумма: {order.total_amount} RUB",
-                    parse_mode="HTML"
-                )
-                
-                # Очищаем корзину
-                if user_id in db.cart:
-                    db.cart[user_id].clear()
-            
-            return
-        
-        elif status == "expired":
-            # Инвойс истёк
-            order = next((o for o in db.orders if o.order_id == order_id), None)
-            if order:
-                order.status = "cancelled"
+        # Таймаут
+        order = next((o for o in db.orders if o.order_id == order_id), None)
+        if order:
+            order.status = "cancelled"
+            try:
                 await bot.send_message(user_id, "⏱️ Время оплаты истекло. Заказ отменён.")
-            return
-        
-        await asyncio.sleep(5)
-    
-    # Таймаут
-    order = next((o for o in db.orders if o.order_id == order_id), None)
-    if order:
-        order.status = "cancelled"
-        await bot.send_message(user_id, "⏱️ Время оплаты истекло. Заказ отменён.")
+            except:
+                pass
+    finally:
+        db.active_payments.pop(order_id, None)
 
 # ==================== КЛАВИАТУРЫ ====================
 def main_menu_keyboard():
@@ -324,19 +352,19 @@ async def cmd_addnums(message: Message):
         return
     
     try:
-        args = message.text.split(None, 1)
-        if len(args) < 2:
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
             await message.answer("Использование: /addnums <код_товара> номер1,номер2,...")
             return
         
-        product_code = args[0].replace("/addnums ", "").lower()
-        numbers_text = args[1]
+        product_code = parts[1].lower()
+        numbers_text = parts[2]
         
         if product_code not in db.products:
             await message.answer(f"❌ Товар '{product_code}' не найден.")
             return
         
-        numbers = [n.strip() for n in numbers_text.split(",")]
+        numbers = [n.strip() for n in numbers_text.split(",") if n.strip()]
         db.products[product_code].numbers.extend(numbers)
         
         await message.answer(
@@ -344,6 +372,7 @@ async def cmd_addnums(message: Message):
             f"Новый сток: {db.products[product_code].stock}"
         )
     except Exception as e:
+        logger.error(f"addnums error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
 @router.message(Command("send"))
@@ -351,7 +380,7 @@ async def cmd_send(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    text = message.text.replace("/send ", "", 1)
+    text = message.text.replace("/send ", "", 1).strip()
     if not text:
         await message.answer("Использование: /send <текст рассылки>")
         return
@@ -371,37 +400,72 @@ async def cmd_backup(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    backup_data = db.save_backup()
-    
-    with open("/tmp/backup.json", "w") as f:
-        f.write(backup_data)
-    
-    await message.answer_document(
-        InputFile("/tmp/backup.json"),
-        caption="💾 Резервная копия GeoShop"
-    )
+    try:
+        backup_data = db.save_backup()
+        
+        with open("/tmp/backup.json", "w") as f:
+            f.write(backup_data)
+        
+        await message.answer_document(
+            InputFile("/tmp/backup.json"),
+            caption="💾 Резервная копия GeoShop"
+        )
+    except Exception as e:
+        logger.error(f"backup error: {e}")
+        await message.answer(f"❌ Ошибка создания резервной копии: {e}")
 
-# ==================== CALLBACK ОБРАБОТЧИКИ - ГЛАВНОЕ МЕНЮ ====================
+@router.message(Command("promo"))
+async def cmd_promo(message: Message):
+    try:
+        code = message.text.replace("/promo ", "").strip().upper()
+        user_id = message.from_user.id
+        
+        if user_id not in db.cart or not db.cart[user_id]:
+            await message.answer("❌ Корзина пуста")
+            return
+        
+        success, msg, new_total = db.apply_promo(user_id, code)
+        
+        if success:
+            promo = db.promo_codes[code]
+            promo.used_count += 1
+        
+        await message.answer(msg)
+    except Exception as e:
+        logger.error(f"promo error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
 @router.callback_query(F.data == "back_to_menu")
-async def callback_back_to_menu(query: CallbackQuery):
-    await query.message.edit_text(
-        "🎉 GeoShop\n\nВыберите действие:",
-        reply_markup=main_menu_keyboard()
-    )
+async def callback_back_to_menu(query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await query.message.edit_text(
+            "🎉 GeoShop\n\nВыберите действие:",
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"back_to_menu error: {e}")
+    await query.answer()
 
 @router.callback_query(F.data == "catalog")
-async def callback_catalog(query: CallbackQuery):
-    await query.message.edit_text(
-        "<b>🏪 Каталог товаров</b>\n\nВыберите номер для подробной информации:",
-        parse_mode="HTML",
-        reply_markup=catalog_keyboard()
-    )
+async def callback_catalog(query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await query.message.edit_text(
+            "<b>🏪 Каталог товаров</b>\n\nВыберите номер для подробной информации:",
+            parse_mode="HTML",
+            reply_markup=catalog_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"catalog error: {e}")
+    await query.answer()
 
 @router.callback_query(F.data.startswith("product_"))
 async def callback_product_details(query: CallbackQuery):
     product_code = query.data.replace("product_", "")
     if product_code not in db.products:
-        await query.answer("❌ Товар не найден")
+        await query.answer("❌ Товар не найден", show_alert=True)
         return
     
     product = db.products[product_code]
@@ -412,11 +476,15 @@ async def callback_product_details(query: CallbackQuery):
         f"Высокая скорость доставки номеров после оплаты."
     )
     
-    await query.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=product_details_keyboard(product_code)
-    )
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=product_details_keyboard(product_code)
+        )
+    except Exception as e:
+        logger.error(f"product_details error: {e}")
+    await query.answer()
 
 @router.callback_query(F.data.startswith("add_cart_"))
 async def callback_add_to_cart(query: CallbackQuery):
@@ -424,7 +492,7 @@ async def callback_add_to_cart(query: CallbackQuery):
     user_id = query.from_user.id
     
     if product_code not in db.products:
-        await query.answer("❌ Товар не найден")
+        await query.answer("❌ Товар не найден", show_alert=True)
         return
     
     if db.products[product_code].stock == 0:
@@ -439,28 +507,36 @@ async def callback_add_to_cart(query: CallbackQuery):
     else:
         db.cart[user_id][product_code] = 1
     
-    await query.answer(f"✅ Добавлено в корзину!", show_alert=False)
+    await query.answer(f"✅ Добавлено в корзину!")
     
     product = db.products[product_code]
-    await query.message.edit_text(
-        f"<b>{product.name}</b>\n\n"
-        f"💰 Цена: {product.price} RUB\n"
-        f"📦 В наличии: {product.stock} шт\n\n"
-        f"✅ Добавлено в корзину!",
-        parse_mode="HTML",
-        reply_markup=product_details_keyboard(product_code)
-    )
+    try:
+        await query.message.edit_text(
+            f"<b>{product.name}</b>\n\n"
+            f"💰 Цена: {product.price} RUB\n"
+            f"📦 В наличии: {product.stock} шт\n\n"
+            f"✅ Добавлено в корзину!",
+            parse_mode="HTML",
+            reply_markup=product_details_keyboard(product_code)
+        )
+    except Exception as e:
+        logger.error(f"add_to_cart error: {e}")
 
 @router.callback_query(F.data == "cart")
-async def callback_cart(query: CallbackQuery):
+async def callback_cart(query: CallbackQuery, state: FSMContext):
+    await state.clear()
     user_id = query.from_user.id
     
     if user_id not in db.cart or not db.cart[user_id]:
-        await query.message.edit_text(
-            "🛒 <b>Корзина пуста</b>",
-            parse_mode="HTML",
-            reply_markup=cart_keyboard(user_id)
-        )
+        try:
+            await query.message.edit_text(
+                "🛒 <b>Корзина пуста</b>",
+                parse_mode="HTML",
+                reply_markup=cart_keyboard(user_id)
+            )
+        except Exception as e:
+            logger.error(f"empty_cart error: {e}")
+        await query.answer()
         return
     
     cart_items = db.cart[user_id]
@@ -477,11 +553,15 @@ async def callback_cart(query: CallbackQuery):
     text += f"<b>Итого: {total_sum}₽</b>\n\n"
     text += "💡 Используйте /promo КОД для применения промокода"
     
-    await query.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=cart_keyboard(user_id)
-    )
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=cart_keyboard(user_id)
+        )
+    except Exception as e:
+        logger.error(f"cart error: {e}")
+    await query.answer()
 
 @router.callback_query(F.data == "clear_cart")
 async def callback_clear_cart(query: CallbackQuery):
@@ -490,7 +570,7 @@ async def callback_clear_cart(query: CallbackQuery):
         db.cart[user_id].clear()
     
     await query.answer("✅ Корзина очищена")
-    await callback_cart(query)
+    await callback_cart(query, FSMContext(MemoryStorage(), None, None))
 
 @router.callback_query(F.data == "checkout")
 async def callback_checkout(query: CallbackQuery):
@@ -520,62 +600,50 @@ async def callback_checkout(query: CallbackQuery):
     invoice_id = await create_invoice(user_id, total_amount, order_id)
     
     if not invoice_id:
-        await query.answer("❌ Ошибка создания платежа", show_alert=True)
+        await query.answer("❌ Ошибка создания платежа. Попробуйте позже.", show_alert=True)
         db.orders.remove(order)
         return
     
     order.invoice_id = invoice_id
-    
-    # Получаем ссылку на инвойс
-    # Ссылка формируется как https://pay.crypt.bot/invoice/INVOICE_ID
     invoice_link = f"https://pay.crypt.bot/invoice/{invoice_id}"
     
-    await query.message.edit_text(
-        f"<b>💳 Оформление заказа</b>\n\n"
-        f"Сумма: {total_amount} RUB\n"
-        f"Заказ: #{order_id}\n\n"
-        f"<a href='{invoice_link}'>Перейти к оплате</a>\n\n"
-        f"Ожидаем оплату (10 минут)...",
-        parse_mode="HTML"
-    )
+    try:
+        await query.message.edit_text(
+            f"<b>💳 Оформление заказа</b>\n\n"
+            f"Сумма: {total_amount} RUB\n"
+            f"Заказ: #{order_id}\n\n"
+            f"<a href='{invoice_link}'>👉 Перейти к оплате</a>\n\n"
+            f"Ожидаем оплату (10 минут)...",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"checkout error: {e}")
+    
+    await query.answer()
     
     # Запускаем фоновую задачу проверки оплаты
     asyncio.create_task(wait_for_payment(query.bot, user_id, order_id, invoice_id))
 
-# ==================== ПРОМОКОДЫ ====================
-@router.message(Command("promo"))
-async def cmd_promo(message: Message):
-    try:
-        code = message.text.replace("/promo ", "").strip().upper()
-        user_id = message.from_user.id
-        
-        if user_id not in db.cart or not db.cart[user_id]:
-            await message.answer("❌ Корзина пуста")
-            return
-        
-        success, msg, new_total = db.apply_promo(user_id, code)
-        
-        if success:
-            promo = db.promo_codes[code]
-            promo.used_count += 1
-        
-        await message.answer(msg)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
 # ==================== АДМИН-ПАНЕЛЬ ====================
-@router.callback_query(F.data == "admin_create_promo", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_create_promo")
 async def callback_admin_create_promo(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.create_promo_code)
-    await query.message.edit_text(
-        "Введите код промокода:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_back")]
-        ])
-    )
+    try:
+        await query.message.edit_text(
+            "Введите код промокода:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_back")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"create_promo error: {e}")
+    await query.answer()
 
 @router.message(AdminStates.create_promo_code)
 async def process_promo_code_input(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     code = message.text.upper()
     
     if code in db.promo_codes:
@@ -590,6 +658,9 @@ async def process_promo_code_input(message: Message, state: FSMContext):
 
 @router.message(AdminStates.create_promo_code_discount)
 async def process_promo_discount_input(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     try:
         discount = int(message.text)
         if not (1 <= discount <= 99):
@@ -606,6 +677,9 @@ async def process_promo_discount_input(message: Message, state: FSMContext):
 
 @router.message(AdminStates.create_promo_code_limit)
 async def process_promo_limit_input(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     try:
         limit = int(message.text)
         if limit < 1:
@@ -629,16 +703,20 @@ async def process_promo_limit_input(message: Message, state: FSMContext):
     except:
         await message.answer("❌ Введите число")
 
-@router.callback_query(F.data == "admin_list_promo", AdminStates.main_menu)
-async def callback_admin_list_promo(query: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "admin_list_promo")
+async def callback_admin_list_promo(query: CallbackQuery):
     if not db.promo_codes:
-        await query.message.edit_text(
-            "📋 <b>Промокоды</b>\n\nНет активных промокодов",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
-            ])
-        )
+        try:
+            await query.message.edit_text(
+                "📋 <b>Промокоды</b>\n\nНет активных промокодов",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"list_promo error: {e}")
+        await query.answer()
         return
     
     text = "<b>📋 Промокоды</b>\n\n"
@@ -651,46 +729,63 @@ async def callback_admin_list_promo(query: CallbackQuery, state: FSMContext):
     
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
     
-    await query.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+    except Exception as e:
+        logger.error(f"list_promo edit error: {e}")
+    await query.answer()
 
-@router.callback_query(F.data.startswith("admin_delete_promo_"), AdminStates.main_menu)
-async def callback_delete_promo(query: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("admin_delete_promo_"))
+async def callback_delete_promo(query: CallbackQuery):
     code = query.data.replace("admin_delete_promo_", "")
     if code in db.promo_codes:
         del db.promo_codes[code]
         await query.answer(f"✅ Промокод {code} удален")
+    else:
+        await query.answer(f"❌ Промокод не найден", show_alert=True)
     
-    await callback_admin_list_promo(query, state)
+    await callback_admin_list_promo(query)
 
-@router.callback_query(F.data == "admin_manage_stock", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_manage_stock")
 async def callback_admin_manage_stock(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.manage_stock)
-    await query.message.edit_text(
-        "📦 <b>Управление стоком</b>\n\nВыберите товар:",
-        parse_mode="HTML",
-        reply_markup=products_select_keyboard(for_stock=True)
-    )
+    try:
+        await query.message.edit_text(
+            "📦 <b>Управление стоком</b>\n\nВыберите товар:",
+            parse_mode="HTML",
+            reply_markup=products_select_keyboard(for_stock=True)
+        )
+    except Exception as e:
+        logger.error(f"manage_stock error: {e}")
+    await query.answer()
 
-@router.callback_query(F.data.startswith("admin_stock_"), AdminStates.manage_stock)
+@router.callback_query(F.data.startswith("admin_stock_"))
 async def callback_select_stock_product(query: CallbackQuery, state: FSMContext):
     product_code = query.data.replace("admin_stock_", "")
     await state.update_data(selected_product=product_code)
     await state.set_state(AdminStates.manage_stock_quantity)
     
     product = db.products[product_code]
-    await query.message.edit_text(
-        f"Выбран: <b>{product.name}</b>\n"
-        f"Текущий сток: {product.stock}\n\n"
-        f"Введите новое количество номеров:",
-        parse_mode="HTML"
-    )
+    try:
+        await query.message.edit_text(
+            f"Выбран: <b>{product.name}</b>\n"
+            f"Текущий сток: {product.stock}\n\n"
+            f"Введите новое количество номеров:",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"select_stock_product error: {e}")
+    await query.answer()
 
 @router.message(AdminStates.manage_stock_quantity)
 async def process_stock_quantity(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     try:
         quantity = int(message.text)
         data = await state.get_data()
@@ -699,7 +794,6 @@ async def process_stock_quantity(message: Message, state: FSMContext):
         
         if quantity < len(product.numbers):
             product.numbers = product.numbers[:quantity]
-        # Если больше - просто обновляем количество (реальные номера добавляются через /addnums или админку)
         
         await state.set_state(AdminStates.main_menu)
         await message.answer(
@@ -710,35 +804,46 @@ async def process_stock_quantity(message: Message, state: FSMContext):
     except:
         await message.answer("❌ Введите число")
 
-@router.callback_query(F.data == "admin_add_numbers", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_add_numbers")
 async def callback_admin_add_numbers(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.add_numbers)
-    await query.message.edit_text(
-        "➕ <b>Пополнение номеров</b>\n\nВыберите товар:",
-        parse_mode="HTML",
-        reply_markup=products_select_keyboard(for_stock=False)
-    )
+    try:
+        await query.message.edit_text(
+            "➕ <b>Пополнение номеров</b>\n\nВыберите товар:",
+            parse_mode="HTML",
+            reply_markup=products_select_keyboard(for_stock=False)
+        )
+    except Exception as e:
+        logger.error(f"add_numbers error: {e}")
+    await query.answer()
 
-@router.callback_query(F.data.startswith("admin_addnum_"), AdminStates.add_numbers)
+@router.callback_query(F.data.startswith("admin_addnum_"))
 async def callback_select_addnum_product(query: CallbackQuery, state: FSMContext):
     product_code = query.data.replace("admin_addnum_", "")
     await state.update_data(selected_product=product_code)
     await state.set_state(AdminStates.add_numbers_input)
     
     product = db.products[product_code]
-    await query.message.edit_text(
-        f"Выбран: <b>{product.name}</b>\n"
-        f"Текущий сток: {product.stock}\n\n"
-        f"Введите номера через запятую:",
-        parse_mode="HTML"
-    )
+    try:
+        await query.message.edit_text(
+            f"Выбран: <b>{product.name}</b>\n"
+            f"Текущий сток: {product.stock}\n\n"
+            f"Введите номера через запятую:",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"select_addnum_product error: {e}")
+    await query.answer()
 
 @router.message(AdminStates.add_numbers_input)
 async def process_add_numbers(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     data = await state.get_data()
     product_code = data.get("selected_product")
     
-    numbers = [n.strip() for n in message.text.split(",")]
+    numbers = [n.strip() for n in message.text.split(",") if n.strip()]
     db.products[product_code].numbers.extend(numbers)
     
     await state.set_state(AdminStates.main_menu)
@@ -749,16 +854,23 @@ async def process_add_numbers(message: Message, state: FSMContext):
         reply_markup=admin_menu_keyboard()
     )
 
-@router.callback_query(F.data == "admin_send_message", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_send_message")
 async def callback_admin_send_message(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.send_message)
-    await query.message.edit_text(
-        "📢 <b>Рассылка сообщений</b>\n\nВведите текст рассылки (поддерживается HTML):",
-        parse_mode="HTML"
-    )
+    try:
+        await query.message.edit_text(
+            "📢 <b>Рассылка сообщений</b>\n\nВведите текст рассылки (поддерживается HTML):",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"send_message error: {e}")
+    await query.answer()
 
 @router.message(AdminStates.send_message)
 async def process_send_message_text(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
     text = message.text
     await state.update_data(send_text=text)
     await state.set_state(AdminStates.send_message_confirm)
@@ -770,43 +882,65 @@ async def process_send_message_text(message: Message, state: FSMContext):
         reply_markup=confirm_keyboard()
     )
 
-@router.callback_query(F.data == "confirm_yes", AdminStates.send_message_confirm)
+@router.callback_query(F.data == "confirm_yes")
 async def callback_confirm_send(query: CallbackQuery, state: FSMContext):
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    
     data = await state.get_data()
     text = data.get("send_text", "")
     
     count = 0
+    failed = 0
     for user_id in db.active_users:
         try:
             await query.bot.send_message(user_id, text, parse_mode="HTML")
             count += 1
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Message send error to {user_id}: {e}")
+            failed += 1
     
     await state.set_state(AdminStates.main_menu)
-    await query.message.edit_text(
-        f"✅ Рассылка завершена!\n\nОтправлено {count} сообщений",
-        reply_markup=admin_menu_keyboard()
-    )
-
-@router.callback_query(F.data == "confirm_no", AdminStates.send_message_confirm)
-async def callback_cancel_send(query: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.main_menu)
-    await query.message.edit_text(
-        "❌ Рассылка отменена",
-        reply_markup=admin_menu_keyboard()
-    )
-
-@router.callback_query(F.data == "admin_orders", AdminStates.main_menu)
-async def callback_admin_orders(query: CallbackQuery, state: FSMContext):
-    if not db.orders:
+    try:
         await query.message.edit_text(
-            "📊 <b>Заказы</b>\n\nНет заказов",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
-            ])
+            f"✅ Рассылка завершена!\n\n"
+            f"Отправлено: {count}\n"
+            f"Ошибок: {failed}",
+            reply_markup=admin_menu_keyboard()
         )
+    except Exception as e:
+        logger.error(f"confirm_send error: {e}")
+    await query.answer()
+
+@router.callback_query(F.data == "confirm_no")
+async def callback_cancel_send(query: CallbackQuery, state: FSMContext):
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    
+    await state.set_state(AdminStates.main_menu)
+    try:
+        await query.message.edit_text(
+            "❌ Рассылка отменена",
+            reply_markup=admin_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"cancel_send error: {e}")
+    await query.answer()
+
+@router.callback_query(F.data == "admin_orders")
+async def callback_admin_orders(query: CallbackQuery):
+    if not db.orders:
+        try:
+            await query.message.edit_text(
+                "📊 <b>Заказы</b>\n\nНет заказов",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"orders error: {e}")
+        await query.answer()
         return
     
     text = "<b>📊 Последние 10 заказов</b>\n\n"
@@ -817,44 +951,63 @@ async def callback_admin_orders(query: CallbackQuery, state: FSMContext):
         text += f"💰 Сумма: {order.total_amount} RUB\n"
         text += f"📌 Статус: {order.status}\n\n"
     
-    await query.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
-        ])
-    )
+    try:
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"orders edit error: {e}")
+    await query.answer()
 
-@router.callback_query(F.data == "admin_backup", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_backup")
 async def callback_admin_backup(query: CallbackQuery):
-    backup_data = db.save_backup()
+    if query.from_user.id not in ADMIN_IDS:
+        return
     
-    with open("/tmp/backup_geoshop.json", "w") as f:
-        f.write(backup_data)
-    
-    await query.message.answer_document(
-        InputFile("/tmp/backup_geoshop.json"),
-        caption="💾 Резервная копия данных GeoShop"
-    )
-    
-    await query.answer("✅ Резервная копия создана")
+    try:
+        backup_data = db.save_backup()
+        
+        with open("/tmp/backup_geoshop.json", "w") as f:
+            f.write(backup_data)
+        
+        await query.message.answer_document(
+            InputFile("/tmp/backup_geoshop.json"),
+            caption="💾 Резервная копия данных GeoShop"
+        )
+        
+        await query.answer("✅ Резервная копия создана")
+    except Exception as e:
+        logger.error(f"backup error: {e}")
+        await query.answer(f"❌ Ошибка: {e}", show_alert=True)
 
-@router.callback_query(F.data == "admin_back", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_back")
 async def callback_admin_back(query: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.main_menu)
-    await query.message.edit_text(
-        "<b>👨‍💼 Админ-панель GeoShop</b>",
-        parse_mode="HTML",
-        reply_markup=admin_menu_keyboard()
-    )
+    try:
+        await query.message.edit_text(
+            "<b>👨‍💼 Админ-панель GeoShop</b>",
+            parse_mode="HTML",
+            reply_markup=admin_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"admin_back error: {e}")
+    await query.answer()
 
-@router.callback_query(F.data == "admin_exit", AdminStates.main_menu)
+@router.callback_query(F.data == "admin_exit")
 async def callback_admin_exit(query: CallbackQuery, state: FSMContext):
     await state.clear()
-    await query.message.edit_text(
-        "👋 Вы вышли из админ-панели",
-        reply_markup=main_menu_keyboard()
-    )
+    try:
+        await query.message.edit_text(
+            "👋 Вы вышли из админ-панели",
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"admin_exit error: {e}")
+    await query.answer()
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 async def main():
@@ -865,7 +1018,10 @@ async def main():
     
     logger.info("🚀 Бот GeoShop запущен")
     
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
